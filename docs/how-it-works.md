@@ -1,21 +1,27 @@
 # How it works
 
-A deep-dive into the `PreToolUse` hook protocol, the Telegram round-trip, and why the script is shaped the way it is.
+A deep-dive into the `PreToolUse` hook protocol, the Telegram round-trip, and the decision flow with feedback, AskUserQuestion, and plan review.
 
-## The flow
+## The flow at a glance
 
-1. **Claude Code calls a tool.** The user asks Claude to do something; the model emits a tool call (Bash, Write, Edit, …). Before actually running it, Claude Code fires the `PreToolUse` hook.
+1. **Claude Code calls a tool.** The user asks Claude to do something; the model emits a tool call (`Bash`, `Write`, `Edit`, `AskUserQuestion`, `ExitPlanMode`, …). Before running it, Claude Code fires the `PreToolUse` hook.
 2. **The hook script receives JSON on stdin.** Claude Code invokes `python3 $HOOK_PATH` and pipes the tool-call envelope to it.
-3. **The script formats the action.** `telegram_approval.py` picks a per-tool formatter (Bash → 🖥️, Write → 📝, …) and builds a human-readable HTML summary.
-4. **Sends a Telegram message.** `POST /bot<TOKEN>/sendMessage` with an `inline_keyboard` of two buttons, each carrying a unique `callback_data` suffix like `approve:f0f2c1e48b9d`.
-5. **Long-polls `getUpdates`.** The script sits in a loop, calling `getUpdates` with a 25-second server-side `timeout`. The outer loop caps total wait at `CLAUDE_TG_TIMEOUT` (default 300s).
-6. **User taps a button.** Telegram queues a `callback_query` update keyed by the bot, which the next `getUpdates` call delivers.
-7. **The script acknowledges and edits.** `answerCallbackQuery` clears the spinner on the user's Telegram client; `editMessageText` rewrites the original message body to show ✅ Approved / ❌ Denied / ⏰ Timed out.
-8. **The script exits.** Approve → exit 0. Deny / timeout → exit 2 with a JSON body describing the decision. Claude Code aborts or continues the tool call accordingly.
+3. **The script dispatches on `tool_name`.**
+   - `AskUserQuestion` → one button per option.
+   - `ExitPlanMode` → plan body + Approve / Terminal / Reject.
+   - Everything else → generic Approve / Terminal / Deny.
+4. **Sends a Telegram message** with an `inline_keyboard`. Every button carries a unique `callback_data` suffix (`approve:f0f2c1e4...`) so concurrent Claude Code sessions can't cross-fire.
+5. **Long-polls `getUpdates`** with a 25-second server-side timeout, looping until the overall `CLAUDE_TG_TIMEOUT` (default 300s) elapses.
+6. **User taps a button.** Telegram queues a `callback_query` update, which the next `getUpdates` call delivers.
+7. **If Deny was tapped**, the script sends a follow-up message asking for an optional reason. It listens for up to `CLAUDE_TG_FEEDBACK_WAIT` (default 60s) for either:
+   - a reply message → used verbatim as the denial reason, or
+   - a `Skip` button tap → uses a default reason.
+8. **`answerCallbackQuery`** clears the Telegram spinner on the user's client; **`editMessageText`** rewrites the original message to show the outcome (✅ Approved / 💻 Deferred / ❌ Denied with feedback / ⏰ Timed out).
+9. **The script exits.** Decisions map to exit codes and JSON on stdout (see below).
 
-## The stdin envelope
+## Stdin envelope
 
-Claude Code sends the hook something like:
+Claude Code sends the hook JSON that looks like:
 
 ```json
 {
@@ -32,78 +38,120 @@ Claude Code sends the hook something like:
 }
 ```
 
-Different tools have different `tool_input` shapes — see the formatters in `hooks/telegram_approval.py` for the full set.
+Different tools have different `tool_input` shapes — see the formatters near the top of `hooks/telegram_approval.py` for the full set.
 
-## The deny response
+## The three decisions
 
-On user denial or timeout, the script writes this JSON to stdout and exits with code 2:
+Every decision is expressed through an exit code plus JSON on stdout:
+
+| Button       | Exit | stdout JSON                                                                                 | What Claude does                                            |
+| ------------ | ---- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| ✅ Approve   | 0    | `{"hookSpecificOutput":{"permissionDecision":"allow", ...}}`                                | Run the tool immediately, no further permission prompt.     |
+| 💻 Terminal  | 0    | *(empty)*                                                                                   | Fall through to the normal permission flow (terminal prompt). |
+| ❌ Deny      | 2    | `{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"...", "additionalContext":"..."}}` | Block the tool; reason is shown to the model so it can adapt. |
+| ⏰ Timed out | 2    | same deny JSON with a timeout reason                                                        | Treated as a deny.                                          |
+
+Exit code 2 is Claude Code's "block this action" signal. Exit 0 with explicit `"allow"` skips any downstream permission prompt; exit 0 with no JSON defers to Claude's default behavior (which is the in-terminal prompt for anything that isn't auto-approved).
+
+## Deny with feedback
+
+After you tap ❌, the hook doesn't immediately exit. It sends a follow-up Telegram message:
+
+```
+🗒 Reply with a reason (what Claude should do instead), or tap Skip to deny without feedback.
+[ Skip (no reason) ]
+```
+
+It then polls for either:
+- a **message** in the same chat whose `reply_to_message.message_id` matches the prompt — the text is used verbatim,
+- a **callback_query** with `data = "skip:<callback_id>"` — uses the default reason,
+- `CLAUDE_TG_FEEDBACK_WAIT` seconds of silence — uses the default reason.
+
+The denial reason Claude sees becomes, for example:
+
+```
+User denied the tool call via Telegram. User said: "run it with -v instead"
+```
+
+Claude reads this and typically retries the tool with the user's requested modification.
+
+## AskUserQuestion routing
+
+When Claude calls `AskUserQuestion`, the stdin looks like:
 
 ```json
 {
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "deny",
-    "permissionDecisionReason": "User denied the tool call via Telegram",
-    "additionalContext": "User denied the tool call via Telegram"
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+    "questions": [{
+      "question": "Which library should we use?",
+      "header": "Library",
+      "options": [
+        {"label": "React", "description": "..." },
+        {"label": "Vue",   "description": "..." }
+      ],
+      "multiSelect": false
+    }]
   }
 }
 ```
 
-Exit code 2 is Claude Code's universal "block this action" signal. The JSON gives the model a clean reason string it can surface in its response to the user.
-
-On approve, the script exits 0 with no stdout, which tells Claude Code "I have no opinion, proceed with normal permission flow."
-
-## Polling, in detail
+The hook shows the question in Telegram with one button per option (up to 10; two per row). Tapping a button sends back an exit-2 with a reason like:
 
 ```
-  ┌──────────────────────────────────────────────┐
-  │ deadline = now + CLAUDE_TG_TIMEOUT (300s)    │
-  └──────────────────────────────────────────────┘
-                       │
-                       ▼
-  ┌─────────────────────────────┐         ┌──────────┐
-  │ while now < deadline:       │────────▶│ timeout  │
-  │   poll = min(25, remaining) │ no upd  │ → deny   │
-  │   getUpdates(offset=X,      │         └──────────┘
-  │              timeout=poll)  │
-  │                             │──upd──▶ ┌──────────┐
-  └─────────────────────────────┘         │ match    │
-                                          │ cb id?   │
-                                          └──────────┘
-                                            ├ yes → answerCallbackQuery,
-                                            │       editMessageText, exit
-                                            └ no  → ack foreign cb, keep polling
+The user answered via Telegram: "React". Treat this as the answer and continue —
+do not call AskUserQuestion again for this question.
 ```
 
-- **Outer timeout (300s)** is the overall patience window; when it elapses the user gets a "⏰ Timed out" banner and Claude is told to deny.
-- **Inner timeout (25s)** is Telegram's server-side long-poll — keeps the connection open just that long, then returns empty so we can loop. Anything larger risks hitting idle timeouts in common reverse proxies.
-- **`offset = last_update_id + 1`** is Telegram's ack model: every update with an id below `offset` is marked consumed and will never be redelivered. We bump it every time we see a new update so we don't re-process the same button press.
+Claude reads the denial reason and treats it as the user's response. The actual `AskUserQuestion` tool never runs — no terminal prompt.
 
-## Why the per-invocation `callback_id`
+**Limitations**: multiSelect questions and questions with more than 10 options fall through to terminal (exit 0 with no JSON), where Claude Code's native UI handles them properly.
 
-One bot can receive `callback_query` updates for any chat it's in. If you have two concurrent Claude Code sessions running (e.g. two terminals, two projects), both would be polling the same bot and competing for updates.
+## Plan review (`ExitPlanMode`)
 
-Solution: each invocation generates a fresh `callback_id = uuid.uuid4().hex[:12]` and embeds it in every button's `callback_data`. When `getUpdates` returns a button press:
+When Claude finishes building an implementation plan and calls `ExitPlanMode`, the hook shows the plan body with Approve / Terminal / Reject buttons. The plan text comes from `tool_input.plan`. Truncated to 3500 chars to fit Telegram's 4096-byte message cap.
 
-- If the `callback_data` suffix matches **this** invocation's id → act on it.
-- If it matches a **different** session's id → acknowledge the callback (so the other user's spinner clears) but keep polling.
+- **Approve** → exit 0 + allow → plan mode exits, Claude starts implementing.
+- **Terminal** → exit 0 → Claude Code's normal plan-approval UI (terminal).
+- **Reject** → exit 2 + deny. Feedback prompt fires just like a regular deny — reply with "reconsider the DB migration step" and Claude revises.
 
-Because Telegram delivers each update to whichever poller reads it first, sessions will sometimes have to "skip past" each other's buttons. The `offset` bump ensures no update is ever dropped — it just gets routed to whichever session owns it.
+## The `callback_id`
 
-## Why exit 2 + JSON
+One bot can receive `callback_query` updates for any chat it's in. If you have two concurrent Claude Code sessions running, they'd both poll the same bot's update queue.
 
-Claude Code's hook contract recognizes several signals:
+Each hook invocation generates a fresh `callback_id = uuid.uuid4().hex[:12]` and embeds it in every button's `callback_data`. When `getUpdates` returns a button press:
 
-| Exit code | Stdout                     | Effect                                    |
-| --------- | -------------------------- | ----------------------------------------- |
-| 0         | (empty)                    | Proceed with normal permission flow       |
-| 0         | `hookSpecificOutput` JSON  | Honor the `permissionDecision` in JSON    |
-| 2         | (anything)                 | Block the tool; show stderr/JSON to model |
+- If the suffix matches **this** invocation's id → act on it.
+- If it matches a **different** session's id → silently acknowledge (so the other user's spinner clears) and keep polling.
 
-We use exit 2 + JSON for deny so the block is unambiguous and the model still gets a structured reason. Approve is plain exit 0 — we don't override Claude Code's own permission flow; we just don't block it.
+Because Telegram delivers each update to whichever poller reads it first, sessions sometimes have to skip past each other's buttons. The `offset = last_update_id + 1` bump ensures no update is ever dropped — it just gets routed to whichever session owns it.
+
+## Polling math
+
+```
+┌──────────────────────────────────────────────┐
+│ deadline = now + CLAUDE_TG_TIMEOUT  (300s)   │
+└──────────────────────────────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────┐
+│ while now < deadline:                │── no upd → deadline elapses → deny
+│   poll = min(25, remaining)          │
+│   getUpdates(offset=X, timeout=poll) │── update  ─────────────────▶ parse
+└──────────────────────────────────────┘                               │
+                                                                       ▼
+                                                            matches our id? yes → act
+                                                                          → no  → ack,
+                                                                                  keep polling
+```
+
+- **Outer timeout (300s)** is your overall patience window.
+- **Inner timeout (25s)** is Telegram's server-side long-poll. Larger values risk tripping reverse-proxy idle timeouts.
+- When you tap ❌, a **second polling phase** kicks in for up to `CLAUDE_TG_FEEDBACK_WAIT` seconds, sharing the same `Poller.offset` so no updates slip past during the handoff.
 
 ## Failure modes
 
-- **Network down, bad token, Telegram 5xx** → `FAIL_OPEN=true` (default) exits 0 so Claude isn't stuck waiting on a bot that can't be reached. Set `FAIL_OPEN=false` for a strict posture that denies on error.
-- **Hook process killed mid-poll** → Claude Code treats it as "no decision" and continues with normal permission flow (i.e. the terminal prompt the hook was supposed to replace). Set the hook `timeout` in `settings.json` higher than `CLAUDE_TG_TIMEOUT` so the script times out itself first.
-- **Concurrent sessions, user taps the wrong chat's button** → the other session's hook will swallow and ignore it thanks to the `callback_id` filter. Just tap again on the right message.
+- **Network down, bad token, Telegram 5xx** → `FAIL_OPEN=true` (default) exits 0 so Claude isn't stuck. Set `FAIL_OPEN=false` for a strict posture that denies on error.
+- **Hook process killed mid-poll** → Claude Code treats it as "no decision" and continues with normal permission flow. Keep the hook `timeout` in `settings.json` at least 20 seconds above `CLAUDE_TG_TIMEOUT` so the script times out itself first.
+- **Concurrent sessions, user taps the wrong chat's button** → the other session's hook silently swallows it (thanks to the `callback_id` filter). Tap again on the right message.
+- **Feedback reply arrives late** → once `CLAUDE_TG_FEEDBACK_WAIT` expires, the hook has already denied with the default reason. The stray reply is consumed by whichever hook picks up the next `getUpdates` call and is ignored.

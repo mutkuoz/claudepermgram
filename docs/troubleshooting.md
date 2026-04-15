@@ -13,6 +13,25 @@ If not:
    ```
 3. Restart `claude` — hooks are loaded at session start.
 
+## Hook fires but no Telegram message arrives
+
+Almost always env-var scope. The hook runs, can't find `CLAUDE_TG_TOKEN` / `CLAUDE_TG_CHAT_ID`, logs `CLAUDE_TG_TOKEN or CLAUDE_TG_CHAT_ID not set - failing open` to stderr, and exits 0 silently so Claude proceeds normally.
+
+Check whether the variables are visible to Claude Code:
+
+```bash
+# Before launching claude, in the same terminal:
+env | grep CLAUDE_TG
+```
+
+If they're missing:
+
+- Bash only reads `.bashrc` for **interactive non-login shells**. If your terminal launches a login shell, or you started Claude Code from a GUI launcher, `.bashrc` isn't sourced. Put the exports in `~/.bash_profile` too, or move them to `~/.profile`.
+- Or set them in `~/.claude/settings.json` under a top-level `env` block (applies regardless of how Claude Code is launched):
+  ```json
+  { "env": { "CLAUDE_TG_TOKEN": "...", "CLAUDE_TG_CHAT_ID": "..." }, "hooks": { ... } }
+  ```
+
 ## "python3: command not found" in Claude Code logs
 
 Your shell sees `python3`, but Claude Code's hook runner may have a stripped `PATH`. Use an absolute path in `settings.json`:
@@ -25,72 +44,64 @@ Find the right path with `which python3`.
 
 ## Telegram returns 401 Unauthorized
 
-The bot token is wrong. Re-copy it from @BotFather (send `/token` to list your bots' tokens). No spaces, no quotes, and it should match the shape `<digits>:<letters/underscores/dashes>`.
+The bot token is wrong. Re-copy it from @BotFather (send `/token` to list your bots' tokens). No spaces, no quotes, shape is `<digits>:<letters/underscores/dashes>`.
 
 ## Telegram returns 403 Forbidden / "bot can't initiate conversation"
 
-You haven't sent a message to your bot yet. Open the chat with your bot in Telegram and send `/start`, then try again.
+You haven't messaged your bot yet. Open the chat with your bot in Telegram and send `/start`, then retry.
 
 ## Chat ID seems wrong — message goes to the wrong chat, or nothing arrives
 
 1. Re-run `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser after sending the bot a fresh message.
-2. Look for the `"chat":{"id":…}` of the message **you** just sent.
-3. For group chats, the ID is negative (often starting with `-100...`). For private chats, it's a positive integer matching your user ID.
+2. Look for the `"chat":{"id":…}` of the message you just sent.
+3. For group chats, the ID is negative (often `-100…`). For private chats, it's a positive integer matching your user ID.
 
 Alternative: message [@userinfobot](https://t.me/userinfobot) — it replies with your user ID, which is also your private-chat ID for bots.
 
-## The message appears but buttons don't do anything
+## Buttons appear but don't do anything
 
-Likely causes, in order of probability:
+In order of probability:
 
-1. **Stale `getUpdates` offset from a previous session.** Another poller (another `telegram_approval.py` process, or a webhook you set up earlier) is consuming updates first. Kill any stray processes:
+1. **Stale `getUpdates` poller.** Another process is consuming updates first. Check:
    ```bash
    pgrep -fa telegram_approval.py
    ```
-   Then make sure you haven't set a webhook — if you ever did, `getUpdates` silently returns nothing:
+2. **A webhook is set on your bot.** When a webhook exists, `getUpdates` silently returns nothing:
    ```bash
    curl "https://api.telegram.org/bot<TOKEN>/deleteWebhook"
    ```
-2. **Concurrent Claude Code sessions.** Multiple hook processes share the same bot's update queue. The per-invocation `callback_id` prevents cross-fire, but you may have to tap each message explicitly. Keep sessions separated by chat (use different group chats per project if this annoys you).
-3. **Outdated hook script.** Early versions of this project didn't use a unique `callback_id`. Re-run `./install.sh` to refresh the copy under `~/.claude/hooks/`.
+3. **Concurrent Claude Code sessions.** Multiple hooks share the bot's update queue. The per-invocation `callback_id` prevents cross-fire, but you may have to tap each message explicitly.
+
+## The deny-feedback prompt doesn't respond to my reply
+
+- Make sure you're using Telegram's **Reply** feature (swipe or long-press the prompt → Reply). A plain new message won't be recognized — the script filters on `reply_to_message.message_id`.
+- The feedback window is `CLAUDE_TG_FEEDBACK_WAIT` seconds (default 60). After that, the hook denies with the default reason.
+- If you want to disable the feedback prompt entirely, `export CLAUDE_TG_ALLOW_FEEDBACK=false`.
+
+## AskUserQuestion falls through to terminal even when I answer in Telegram
+
+`multiSelect: true` questions and questions with more than 10 options are deliberately deferred to terminal — inline keyboards don't handle multi-select cleanly. This is by design. If Claude asked a single-select question with ≤10 options and it still fell through, check the hook's stderr for an error.
+
+## The plan review message is cut off
+
+Telegram caps message bodies at 4096 characters. The script truncates plan text to 3500 chars; anything beyond is elided with a `... [N more chars]` suffix. If your plans are routinely longer, the right answer is to split them — but you can also bump `MAX_PLAN_LEN` in `~/.claude/hooks/telegram_approval.py`.
 
 ## Approval times out immediately
 
 Three things to check:
 
-- **System clock** — `timedatectl status` (Linux) or `date` (macOS). If it's off by more than a few minutes, the HTTPS handshake to `api.telegram.org` may fail and the script falls through to the timeout path.
-- **`CLAUDE_TG_TIMEOUT`** — if you `export CLAUDE_TG_TIMEOUT=0` by accident, every request times out instantly. Default is 300.
-- **Claude Code hook `timeout`** — if the `timeout` field in `settings.json` is lower than `CLAUDE_TG_TIMEOUT`, Claude Code kills the hook before it finishes polling. Keep `settings.json`'s timeout at least 20 seconds above `CLAUDE_TG_TIMEOUT`.
+- **System clock** — `timedatectl status` (Linux) or `date` (macOS). Skew of more than a few minutes breaks the HTTPS handshake to `api.telegram.org`.
+- **`CLAUDE_TG_TIMEOUT`** — setting it to 0 makes every request time out instantly. Default is 300.
+- **Claude Code hook `timeout`** — must be higher than `CLAUDE_TG_TIMEOUT + ~20`. Default in our `settings.json` is 320.
 
 ## Merging with an existing settings.json that already has hooks
 
-`install.sh` handles this automatically (jq if present, Python fallback otherwise), but if you're merging by hand, the structure is:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      { "matcher": "...existing matcher...", "hooks": [ /* existing hook */ ] },
-      { "matcher": "Bash|Write|Edit|MultiEdit|Read|Glob|Grep|WebFetch|WebSearch|Agent",
-        "hooks": [
-          { "type": "command",
-            "command": "python3 $HOME/.claude/hooks/telegram_approval.py",
-            "timeout": 320 }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Order matters if the matchers overlap — Claude Code runs hooks in the order they appear. For approval, putting this hook first means it runs before any other side-effectful hook you might have.
-
-Jq one-liner for manual merge:
+`install.sh` handles this automatically (jq if present, Python fallback otherwise). By hand:
 
 ```bash
 jq '.hooks.PreToolUse += [
   {
-    matcher: "Bash|Write|Edit|MultiEdit|Read|Glob|Grep|WebFetch|WebSearch|Agent",
+    matcher: "Bash|Write|Edit|MultiEdit|Read|Glob|Grep|WebFetch|WebSearch|Agent|AskUserQuestion|ExitPlanMode",
     hooks: [{ type: "command",
               command: "python3 $HOME/.claude/hooks/telegram_approval.py",
               timeout: 320 }]
@@ -98,13 +109,12 @@ jq '.hooks.PreToolUse += [
 ]' ~/.claude/settings.json > /tmp/s.json && mv /tmp/s.json ~/.claude/settings.json
 ```
 
+Order within `PreToolUse` matters when matchers overlap — putting this hook first means it runs before any other side-effectful hook.
+
 ## The test Telegram message arrives, but Claude-triggered ones don't
 
-Almost always env-var scope:
-
-- The installer wrote `export CLAUDE_TG_TOKEN=...` to your shell rc, but you're running Claude Code from a terminal that was open before the rc changed. Solution: open a new terminal, or `source ~/.zshrc` (or `.bashrc`).
-- You set the vars in your shell but launched Claude Code from a macOS Finder / Dock icon — Finder doesn't inherit shell env. Launch Claude Code from the terminal instead, or define the env vars at the OS level (`launchctl setenv` on macOS).
+See [*Hook fires but no Telegram message arrives*](#hook-fires-but-no-telegram-message-arrives). Short version: the installer wrote exports to your shell rc, but Claude Code was launched from a shell that didn't source it. Open a fresh terminal, or set the vars in `~/.claude/settings.json` → `env`.
 
 ## Hook runs but Claude still shows the normal terminal approval prompt
 
-Claude Code falls back to the default permission flow when the hook exits 0 with no JSON. That's the expected behavior on approve — the terminal prompt isn't bypassed, it's been pre-approved via your Telegram tap. If you see it anyway, the hook likely errored out early and took the `FAIL_OPEN=true` path. Check Claude Code's hook logs (look for stderr lines starting with `[telegram_approval]`).
+Means the hook exited 0 with no JSON — which is exactly what **💻 Terminal** does by design. If you tapped ✅ Approve and still got a terminal prompt, the hook likely hit an error early and took the `FAIL_OPEN=true` path. Check Claude Code's logs for stderr lines starting with `[telegram_approval]`.
