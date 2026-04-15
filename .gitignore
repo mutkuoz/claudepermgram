@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local config / secrets — never commit real tokens
+.env
+.env.*
+!.env.example
+
+# Harness / session state (not part of the project)
+.claude/
+.remember/
