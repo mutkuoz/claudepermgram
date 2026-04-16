@@ -69,6 +69,18 @@ POLL_TIMEOUT = 25
 # "Read", "Glob", "Grep" to skip prompts for read-only operations.
 EXCLUDED_TOOLS = []
 
+# Tools that Claude Code auto-approves when `permission_mode` is
+# "acceptEdits". We mirror that so Telegram doesn't buzz for things
+# the user has already blanket-approved for the session.
+ACCEPT_EDITS_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+# Honor Claude Code's per-session permission_mode. When True (default),
+# we silently approve tool calls that Claude would already auto-approve:
+#   - permission_mode = "bypassPermissions" -> approve everything
+#   - permission_mode = "acceptEdits"       -> approve file-edit tools
+# Set to "false" for strict mode: always prompt on Telegram regardless.
+RESPECT_MODE = os.environ.get("CLAUDE_TG_RESPECT_MODE", "true").lower() == "true"
+
 # Telegram caps message bodies at 4096 chars; we truncate previews to
 # stay well under the limit. Plan review gets a larger budget.
 MAX_FIELD_LEN = 400
@@ -666,9 +678,24 @@ def main():
     tool_input = payload.get("tool_input", {}) or {}
     cwd = payload.get("cwd", "")
     session_id = payload.get("session_id", "")
+    # Claude Code reports the session's permission mode in stdin.
+    # Newer builds use snake_case; older ones used camelCase — accept both.
+    permission_mode = (
+        payload.get("permission_mode")
+        or payload.get("permissionMode")
+        or ""
+    )
 
     if tool_name in EXCLUDED_TOOLS:
         approve()
+
+    # If Claude Code would already auto-approve this tool, don't waste a
+    # Telegram round-trip asking about it.
+    if RESPECT_MODE:
+        if permission_mode == "bypassPermissions":
+            approve()
+        if permission_mode == "acceptEdits" and tool_name in ACCEPT_EDITS_TOOLS:
+            approve()
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
         fail_open_or_deny("CLAUDE_TG_TOKEN or CLAUDE_TG_CHAT_ID not set")

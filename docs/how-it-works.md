@@ -149,6 +149,19 @@ Because Telegram delivers each update to whichever poller reads it first, sessio
 - **Inner timeout (25s)** is Telegram's server-side long-poll. Larger values risk tripping reverse-proxy idle timeouts.
 - When you tap ❌, a **second polling phase** kicks in for up to `CLAUDE_TG_FEEDBACK_WAIT` seconds, sharing the same `Poller.offset` so no updates slip past during the handoff.
 
+## Permission-mode mirroring
+
+Claude Code's session has a `permission_mode` (`default`, `acceptEdits`, `plan`, `bypassPermissions`). When `CLAUDE_TG_RESPECT_MODE=true` (the default), the hook short-circuits before any Telegram request for tools Claude would already auto-approve:
+
+| `permission_mode`     | What the hook does                                                   |
+| --------------------- | -------------------------------------------------------------------- |
+| `default`             | Prompt via Telegram as usual.                                        |
+| `acceptEdits`         | Silent allow for `Edit` / `Write` / `MultiEdit` / `NotebookEdit`. Everything else still prompts. |
+| `bypassPermissions`   | Silent allow for every tool. Hook returns `permissionDecision: "allow"` without any Telegram round-trip. |
+| `plan`                | Prompt as usual. Plan mode only allows `ExitPlanMode` anyway; that's exactly when you want Telegram review. |
+
+Set `CLAUDE_TG_RESPECT_MODE=false` for strict mode — always ask on Telegram regardless of session mode.
+
 ## Failure modes
 
 - **Network down, bad token, Telegram 5xx** → `FAIL_OPEN=true` (default) exits 0 so Claude isn't stuck. Set `FAIL_OPEN=false` for a strict posture that denies on error.

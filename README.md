@@ -60,6 +60,7 @@ Set these in your shell rc (the installer does it for you) or in `~/.claude/sett
 | `CLAUDE_TG_FEEDBACK_WAIT`    | Seconds to wait for a deny-reason reply after tapping ❌ (0 disables)   | `60`    | no       |
 | `CLAUDE_TG_ALLOW_TERMINAL`   | Show the 💻 Terminal button                                              | `true`  | no       |
 | `CLAUDE_TG_ALLOW_FEEDBACK`   | Prompt for an optional deny reason after ❌                              | `true`  | no       |
+| `CLAUDE_TG_RESPECT_MODE`     | Mirror Claude's `permission_mode` (auto-approve when Claude would)       | `true`  | no       |
 | `CLAUDE_TG_FAIL_OPEN`        | `true` → approve on Telegram errors, `false` → deny                      | `true`  | no       |
 
 ## How it works
@@ -106,6 +107,14 @@ If you don't want buzzed every time Claude reads a file:
   ```
 
 Matcher changes are cheaper — they skip invoking the hook entirely for excluded tools.
+
+### Mirror Claude's permission mode
+
+By default, when Claude Code's session is in `acceptEdits` mode, Telegram **doesn't** buzz for Edit/Write/MultiEdit — Claude would auto-approve them anyway. In `bypassPermissions` mode, nothing prompts via Telegram. Flip to strict-always-ask with:
+
+```bash
+export CLAUDE_TG_RESPECT_MODE=false
+```
 
 ### Hide the terminal / feedback options
 
